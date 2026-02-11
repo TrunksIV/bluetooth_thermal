@@ -1,0 +1,456 @@
+import 'dart:async';
+import 'dart:developer';
+import 'dart:io';
+import 'package:bloc/bloc.dart';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:blue_thermal_printer/blue_thermal_printer.dart';
+import 'package:flutter/services.dart';
+import 'package:merchant_app/blocs/terminal_info_bloc/terminal_info_bloc.dart';
+import 'package:merchant_app/models/payment_status/payment_status_response.dart';
+import 'package:merchant_app/models/payments/payment_response.dart' as pr;
+import 'package:merchant_app/models/transactions/transactions_response.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
+part 'printer_state.dart';
+
+class PrinterCubit extends Cubit<PrinterState> {
+  final BlueThermalPrinter _bluetooth = BlueThermalPrinter.instance;
+  BluetoothDevice? selectedDevice;
+  StreamSubscription? _stateSubscription;
+  final TerminalInfoBloc terminalInfoBloc;
+
+  PrinterCubit({required this.terminalInfoBloc}) : super(PrinterInitial()) {
+    refreshDevices();
+  }
+
+  List<BluetoothDevice> _availableDevices = [];
+
+  List<BluetoothDevice> get availableDevices => _availableDevices;
+
+  Future<void> refreshDevices() async {
+    try {
+      _availableDevices = await _bluetooth.getBondedDevices();
+      var device = _availableDevices.firstWhere(
+        (element) => element.name?.toLowerCase().startsWith("virt") ?? false,
+      );
+
+      if (device.name != null) {
+        selectedDevice = device;
+        await connect();
+      }
+
+      emit(PrinterDevicesLoaded(_availableDevices));
+    } on PlatformException catch (e) {
+      emit(PrinterError(e.toString()));
+    }
+
+    _stateSubscription = _bluetooth.onStateChanged().listen((state) {
+      if (state == BlueThermalPrinter.CONNECTED) {
+        emit(PrinterConnected(selectedDevice));
+      } else if (state == BlueThermalPrinter.DISCONNECTED) {
+        emit(PrinterDisconnected(selectedDevice));
+      }
+    });
+  }
+
+  Future<void> connect() async {
+    if (selectedDevice == null) {
+      emit(PrinterError('No device selected'));
+      return;
+    }
+
+    // Request required permissions
+    final Map<Permission, PermissionStatus> statuses =
+        await [
+          Permission.bluetoothConnect,
+          Permission.bluetoothScan,
+          Permission.locationWhenInUse,
+        ].request();
+
+    if (!statuses[Permission.bluetoothConnect]!.isGranted) {
+      emit(PrinterError('Bluetooth connect permission required'));
+      return;
+    }
+
+    if (!statuses[Permission.bluetoothScan]!.isGranted) {
+      emit(PrinterError('Bluetooth scan permission required'));
+      return;
+    }
+
+    if (!statuses[Permission.locationWhenInUse]!.isGranted) {
+      emit(PrinterError('Location permission required for Bluetooth'));
+      return;
+    }
+
+    try {
+      // First disconnect if currently connected
+      if (await _bluetooth.isConnected ?? false) {
+        await _bluetooth.disconnect();
+      }
+
+      // Add timeout for connection attempt
+      await _bluetooth
+          .connect(selectedDevice!)
+          .timeout(const Duration(seconds: 10));
+
+      // Verify connection
+      final isConnected = await _bluetooth.isConnected ?? false;
+      if (isConnected) {
+        emit(PrinterConnected(selectedDevice));
+      } else {
+        emit(PrinterError('Failed to verify connection'));
+      }
+    } on TimeoutException {
+      emit(PrinterError('Connection timed out'));
+    } catch (e) {
+      emit(PrinterError('Connection failed: ${e.toString()}'));
+    }
+  }
+
+  Future<void> disconnect() async {
+    try {
+      final wasConnected = await _bluetooth.isConnected ?? false;
+      if (wasConnected) {
+        await _bluetooth.disconnect().timeout(const Duration(seconds: 5));
+      }
+      emit(PrinterDisconnected(selectedDevice));
+    } on TimeoutException {
+      emit(PrinterError('Disconnect timed out'));
+    } catch (e) {
+      emit(PrinterError('Disconnect failed: ${e.toString()}'));
+    }
+  }
+
+  Future<void> printReceipt(Map<String, dynamic> data) async {
+    if (state is! PrinterConnected) {
+      emit(PrinterError('Not connected to printer'));
+      return;
+    }
+
+    try {
+      // Verify connection first
+      final isConnected = await _bluetooth.isConnected ?? false;
+      if (!isConnected) {
+        emit(PrinterError('Lost connection to printer'));
+        return;
+      }
+
+      // Print with timeout
+      await _bluetooth.printNewLine().timeout(const Duration(seconds: 5));
+
+      // Add more printing commands as needed
+      await _bluetooth
+          .printCustom('TEST PRINT', 1, 1)
+          .timeout(const Duration(seconds: 5));
+      await _bluetooth.printNewLine().timeout(const Duration(seconds: 5));
+
+      emit(PrinterPrintSuccess());
+    } on TimeoutException {
+      emit(PrinterError('Print operation timed out'));
+    } catch (e) {
+      emit(PrinterError('Print failed: ${e.toString()}'));
+    }
+  }
+
+  void printTransaction(Transaction transaction) async {
+    try {
+      // Verify connection first
+      final isConnected = await _bluetooth.isConnected ?? false;
+      if (!isConnected) {
+        emit(PrinterError('Lost connection to printer'));
+        return;
+      }
+
+      TerminalInfoState terminalInfoState = terminalInfoBloc.state;
+
+      if (terminalInfoState is! TerminalInfoLoaded) return;
+      ByteData bytesData = await rootBundle.load("assets/logo/receipt.png");
+
+      String filename = "receipt.png";
+
+      String dir = (await getApplicationDocumentsDirectory()).path;
+      File file = await File('$dir/$filename').writeAsBytes(
+        bytesData.buffer.asUint8List(
+          bytesData.offsetInBytes,
+          bytesData.lengthInBytes,
+        ),
+      );
+      DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
+      String? serialNumber;
+
+      // Print with timeout
+      await _bluetooth.printNewLine().timeout(const Duration(seconds: 5));
+
+      // Get Serial Number
+      if (Platform.isAndroid) {
+        AndroidDeviceInfo info = await deviceInfo.androidInfo;
+        log("Am here ${info.data['serialNumber']}");
+        serialNumber = info.data['serialNumber'];
+      }
+      await _bluetooth.printImage(file.path);
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+
+      // Print Merchant Details
+      await _bluetooth.printLeftRight(
+        "${terminalInfoState.terminalInfo.data?.merchantName} ",
+        "${terminalInfoState.terminalInfo.data?.merchantCode}",
+        1,
+      );
+
+      await _bluetooth.print3Column(
+        "",
+        transaction.transactiondate ?? "",
+        "",
+        0,
+      );
+      await _bluetooth.printNewLine();
+      await _bluetooth.print3Column("", "CUSTOMER COPY", "", 1);
+      await _bluetooth.print3Column("", "Processed", "", 1);
+      await _bluetooth.printNewLine();
+
+      // Transasction Details
+      await _bluetooth.printLeftRight(
+        "STATUS",
+        transaction.paymentstatus != null &&
+                transaction.paymentstatus == "COMPLETE"
+            ? "SUCCESS"
+            : transaction.paymentstatus ?? "N/A",
+        0,
+      );
+      await _bluetooth.printLeftRight(
+        "REFERENCE",
+        "${transaction.ordernumber}",
+        0,
+      );
+      await _bluetooth.printLeftRight(
+        "CUSTOMER",
+        transaction.payer ?? 'UNKOWN',
+        0,
+      );
+      await _bluetooth.printLeftRight("SERIAL NO", serialNumber ?? '', 0);
+      await _bluetooth.printLeftRight(
+        "TERMINAL ID",
+        "${terminalInfoState.terminalInfo.data?.terminalId}",
+        0,
+      );
+      await _bluetooth.printLeftRight(
+        "AMOUNT",
+        "${transaction.currency} ${transaction.amount}",
+        0,
+      );
+      await _bluetooth.printLeftRight(
+        "SERVICE FEE",
+        "${transaction.customerFees ?? ''}",
+        0,
+      );
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+
+      await _bluetooth.printCustom(
+        '${transaction.currency} ${getTotal(transaction)}',
+        4,
+        1,
+      );
+      await _bluetooth.printNewLine();
+      await _bluetooth.printCustom("DUPLICATE  COPY ", 1, 1);
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+      emit(PrinterPrintSuccess());
+    } on TimeoutException {
+      emit(PrinterError('Print operation timed out'));
+    } catch (e) {
+      emit(PrinterError('Print failed: ${e.toString()}'));
+    }
+  }
+
+  void printSuccessReceipt(
+    PaymentStatusResponse res,
+    String phone,
+    pr.PaymentResponse? payment,
+  ) async {
+    try {
+      // Verify connection first
+      final isConnected = await _bluetooth.isConnected ?? false;
+      if (!isConnected) {
+        emit(PrinterError('Lost connection to printer'));
+        return;
+      }
+
+      TerminalInfoState terminalInfoState = terminalInfoBloc.state;
+
+      if (terminalInfoState is! TerminalInfoLoaded) return;
+      ByteData bytesData = await rootBundle.load("assets/logo/receipt.png");
+
+      String filename = "receipt.png";
+
+      String dir = (await getApplicationDocumentsDirectory()).path;
+      File file = await File('$dir/$filename').writeAsBytes(
+        bytesData.buffer.asUint8List(
+          bytesData.offsetInBytes,
+          bytesData.lengthInBytes,
+        ),
+      );
+      DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
+      String? serialNumber;
+
+      // Print with timeout
+      await _bluetooth.printNewLine().timeout(const Duration(seconds: 5));
+
+      // Get Serial Number
+      if (Platform.isAndroid) {
+        AndroidDeviceInfo info = await deviceInfo.androidInfo;
+        log("Am here ${info.data['serialNumber']}");
+        serialNumber = info.data['serialNumber'];
+      }
+      await _bluetooth.printImage(file.path);
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+
+      // Print Merchant Details
+      await _bluetooth.printLeftRight(
+        "${terminalInfoState.terminalInfo.data?.merchantName} ",
+        "${terminalInfoState.terminalInfo.data?.merchantCode}",
+        1,
+      );
+
+      await _bluetooth.print3Column(
+        "",
+        getTransactionDate(payment?.data?.transaction?.transactionDate ?? ""),
+        "",
+        0,
+      );
+      await _bluetooth.printNewLine();
+
+      await _bluetooth.print3Column("", "CUSTOMER COPY", "", 1);
+      await _bluetooth.print3Column("", "Processed", "", 1);
+      await _bluetooth.printNewLine();
+
+      // Transasction Details
+      await _bluetooth.printLeftRight(
+        "STATUS",
+        res.data?.status == 100 ? 'SUCCESS' : 'FAILED',
+        0,
+      );
+      await _bluetooth.printLeftRight("REFERENCE", "${res.data?.token}", 0);
+      await _bluetooth.printLeftRight("CUSTOMER", phone, 0);
+      await _bluetooth.printLeftRight("SERIAL NO", serialNumber ?? '', 0);
+      await _bluetooth.printLeftRight(
+        "TERMINAL ID",
+        "${terminalInfoState.terminalInfo.data?.terminalId}",
+        0,
+      );
+
+      if (payment?.data?.fees != null) {
+        await _bluetooth.printLeftRight(
+          "AMOUNT",
+          "${res.data?.currency} ${payment?.data?.fees?.breakdown?.baseAmount}",
+          0,
+        );
+        await _bluetooth.printLeftRight(
+          "SERVICE FEE",
+          getTotalFees(payment?.data?.fees),
+          0,
+        );
+      }
+
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+
+      await _bluetooth.printCustom(
+        '${res.data?.currency} ${getTotalAmount(payment?.data?.transaction)}',
+        4,
+        1,
+      );
+      await _bluetooth.printNewLine();
+      await _bluetooth.printCustom("ORIGINAL  COPY ", 1, 1);
+      await _bluetooth.printNewLine();
+      await _bluetooth.printNewLine();
+
+      emit(PrinterPrintSuccess());
+    } on TimeoutException {
+      emit(PrinterError('Print operation timed out'));
+    } catch (e) {
+      emit(PrinterError('Print failed: ${e.toString()}'));
+    }
+  }
+
+  getTotalFees(pr.Fees? fees) {
+    log("Calculating total fees for: ${fees?.toJson()}");
+    try {
+      double total =
+          fees?.breakdown?.customerFees != null
+              ? double.parse(fees!.breakdown!.customerFees.toString())
+              : 0.0;
+      return total.toStringAsFixed(2);
+    } catch (e) {
+      log("Error getting total fees: $e");
+      return "N/A";
+    }
+  }
+
+  getTotalAmount(pr.Transaction? fees) {
+    log("Calculating total amount for: ${fees?.toJson()}");
+    try {
+      double total = double.parse(fees!.customerPays.toString());
+      return total.toStringAsFixed(2);
+    } catch (e) {
+      log("Error getting total amount: $e");
+      return "N/A";
+    }
+  }
+
+  String getTotal(Transaction transaction) {
+    try {
+      var amount = double.tryParse(transaction.amount ?? "0");
+      var customerFees = transaction.customerFees;
+
+      if (amount == null) {
+        return transaction.amount ?? 'N/A';
+      }
+
+      var total = amount + customerFees;
+
+      return total.toStringAsFixed(2);
+    } catch (e) {
+      log("The Total calculation error $e");
+      return transaction.amount ?? 'N/A';
+    }
+  }
+  // String getDate() {
+  //   DateTime date = DateTime.now();
+
+  //   final DateFormat dateFormat = DateFormat("yyyy/MM/dd ");
+  //   return dateFormat.format(date);
+  // }
+  String getTransactionDate(String date) {
+    try {
+      DateTime parsedDate =
+          DateTime.parse(date).toLocal(); // Convert from UTC to local time
+      String formattedDate = DateFormat(
+        'yyyy-MM-dd HH:mm:ss',
+      ).format(parsedDate);
+
+      return formattedDate;
+    } catch (e) {
+      return "N/A";
+    }
+  }
+
+  String getTime() {
+    DateTime date = DateTime.now();
+
+    final DateFormat dateFormat = DateFormat("HH:mm s ");
+    return dateFormat.format(date);
+  }
+
+  @override
+  Future<void> close() {
+    _stateSubscription?.cancel();
+    return super.close();
+  }
+}
